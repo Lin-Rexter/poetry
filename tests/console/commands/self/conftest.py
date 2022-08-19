@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Callable
 
 import pytest
 
 from poetry.core.packages.package import Package
 
 from poetry.__version__ import __version__
+from poetry.factory import Factory
 from poetry.repositories import Pool
 from poetry.utils.env import EnvManager
 
@@ -14,8 +16,10 @@ from poetry.utils.env import EnvManager
 if TYPE_CHECKING:
     import httpretty
 
+    from cleo.io.io import IO
     from pytest_mock import MockerFixture
 
+    from poetry.config.config import Config
     from poetry.repositories.repository import Repository
     from poetry.utils.env import VirtualEnv
     from tests.helpers import TestRepository
@@ -38,6 +42,16 @@ def pool(repo: TestRepository) -> Pool:
     return Pool([repo])
 
 
+def create_pool_factory(repo: Repository) -> Callable[[Config, IO, bool], Pool]:
+    def _create_pool(config: Config, io: IO, disable_cache: bool = False) -> Pool:
+        pool = Pool()
+        pool.add_repository(repo)
+
+        return pool
+
+    return _create_pool
+
+
 @pytest.fixture(autouse=True)
 def setup_mocks(
     mocker: MockerFixture,
@@ -45,6 +59,7 @@ def setup_mocks(
     installed: Repository,
     pool: Pool,
     http: type[httpretty.httpretty],
+    repo: Repository,
 ) -> None:
     mocker.patch.object(EnvManager, "get_system_env", return_value=tmp_venv)
     mocker.patch("poetry.repositories.pool.Pool.find_packages", pool.find_packages)
@@ -54,3 +69,4 @@ def setup_mocks(
         "poetry.installation.installer.Installer._get_installed",
         return_value=installed,
     )
+    mocker.patch.object(Factory, "create_pool", side_effect=create_pool_factory(repo))
