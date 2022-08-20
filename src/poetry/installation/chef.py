@@ -2,9 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tarfile
+import tempfile
+import threading
+import zipfile
 
+from contextlib import AbstractContextManager
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Collection
+
+from build import BuildBackendException
+from build import ProjectBuilder
+from build.env import IsolatedEnv as BaseIsolatedEnv
+from pep517 import quiet_subprocess_runner  # type: ignore[import]
+from poetry.core.utils.helpers import temporary_directory
 
 from poetry.installation.chooser import InvalidWheelName
 from poetry.installation.chooser import Wheel
@@ -17,12 +32,152 @@ if TYPE_CHECKING:
     from poetry.utils.env import Env
 
 
+class ChefError(Exception):
+    ...
+
+
+class ChefBuildError(ChefError):
+    ...
+
+
+class IsolatedEnv(BaseIsolatedEnv):
+    def __init__(self, env: Env, config: Config) -> None:
+        self._env = env
+        self._config = config
+
+    @property
+    def executable(self) -> str:
+        return str(self._env.python)
+
+    @property
+    def scripts_dir(self) -> str:
+        return str(self._env._bin_dir)
+
+    def install(self, requirements: Collection[str]) -> None:
+        from cleo.io.null_io import NullIO
+        from poetry.core.packages.dependency import Dependency
+        from poetry.core.packages.project_package import ProjectPackage
+
+        from poetry.factory import Factory
+        from poetry.installation.installer import Installer
+        from poetry.packages.locker import NullLocker
+        from poetry.repositories.installed_repository import InstalledRepository
+
+        # We build Poetry dependencies from the requirements
+        package = ProjectPackage("__root__", "0.0.0")
+        package.python_versions = ".".join(str(v) for v in self._env.version_info[:3])
+        for requirement in requirements:
+            dependency = Dependency.create_from_pep_508(requirement)
+            package.add_dependency(dependency)
+
+        pool = Factory.create_pool(self._config)
+        installer = Installer(
+            NullIO(),
+            self._env,
+            package,
+            NullLocker(self._env.path.joinpath("poetry.lock"), {}),
+            pool,
+            Factory.create_config(NullIO()),
+            InstalledRepository.load(self._env),
+        )
+        installer.update(True)
+        installer.run()
+
+
 class Chef:
     def __init__(self, config: Config, env: Env) -> None:
+        self._config = config
         self._env = env
         self._cache_dir = (
             Path(config.get("cache-dir")).expanduser().joinpath("artifacts")
         )
+        self._lock = threading.Lock()
+
+    def prepare(self, archive: Path, output_dir: Path | None = None) -> Path:
+        if not self.should_prepare(archive):
+            return archive
+
+        if archive.is_dir():
+            tmp_dir = tempfile.mkdtemp(prefix="poetry-chef-")
+
+            return self._prepare(archive, Path(tmp_dir))
+
+        return self._prepare_sdist(archive, destination=output_dir)
+
+    def _prepare(self, directory: Path, destination: Path) -> Path:
+        from poetry.utils.env import EnvManager
+        from poetry.utils.env import VirtualEnv
+
+        with self._lock, temporary_directory() as tmp_dir:
+            EnvManager.build_venv(tmp_dir, executable=self._env.python, with_pip=True)
+            venv = VirtualEnv(Path(tmp_dir))
+            env = IsolatedEnv(venv, self._config)
+            builder = ProjectBuilder(
+                directory,
+                python_executable=env.executable,
+                scripts_dir=env.scripts_dir,
+                runner=quiet_subprocess_runner,
+            )
+            env.install(builder.build_system_requires)
+            env.install(
+                builder.build_system_requires | builder.get_requires_for_build("wheel")
+            )
+
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                try:
+                    return Path(
+                        builder.build(
+                            "wheel",
+                            destination.as_posix(),
+                        )
+                    )
+                except BuildBackendException as e:
+                    raise ChefBuildError(str(e))
+
+    def _prepare_sdist(self, archive: Path, destination: Path | None = None) -> Path:
+        from poetry.core.packages.utils.link import Link
+
+        suffix = archive.suffix
+        context: Callable[
+            [str], AbstractContextManager[zipfile.ZipFile | tarfile.TarFile]
+        ]
+        if suffix == ".zip":
+            context = zipfile.ZipFile
+        else:
+            context = tarfile.open
+
+        with temporary_directory() as tmp_dir:
+            with context(archive.as_posix()) as archive_archive:
+                archive_archive.extractall(tmp_dir)
+
+            archive_dir = Path(tmp_dir)
+
+            elements = list(archive_dir.glob("*"))
+
+            if len(elements) == 1 and elements[0].is_dir():
+                sdist_dir = elements[0]
+            else:
+                sdist_dir = archive_dir / archive.name.rstrip(suffix)
+                if not sdist_dir.is_dir():
+                    sdist_dir = archive_dir
+
+            if destination is None:
+                destination = self.get_cache_directory_for_link(Link(archive.as_uri()))
+
+            destination.mkdir(parents=True, exist_ok=True)
+
+            return self._prepare(
+                sdist_dir,
+                destination,
+            )
+
+    def should_prepare(self, archive: Path) -> bool:
+        return archive.is_dir() or not self.is_wheel(archive)
+
+    @classmethod
+    def is_wheel(cls, archive: Path) -> bool:
+        return archive.suffix == ".whl"
 
     def get_cached_archive_for_link(self, link: Link) -> Path | None:
         archives = self.get_cached_archives_for_link(link)
