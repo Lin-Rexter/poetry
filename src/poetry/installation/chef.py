@@ -58,6 +58,7 @@ class IsolatedEnv(BaseIsolatedEnv):
         from poetry.core.packages.dependency import Dependency
         from poetry.core.packages.project_package import ProjectPackage
 
+        from poetry.config.config import Config
         from poetry.factory import Factory
         from poetry.installation.installer import Installer
         from poetry.packages.locker import NullLocker
@@ -77,7 +78,7 @@ class IsolatedEnv(BaseIsolatedEnv):
             package,
             NullLocker(self._env.path.joinpath("poetry.lock"), {}),
             pool,
-            Factory.create_config(NullIO()),
+            Config.create(),
             InstalledRepository.load(self._env),
         )
         installer.update(True)
