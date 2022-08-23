@@ -94,18 +94,22 @@ class Chef:
         )
         self._lock = threading.Lock()
 
-    def prepare(self, archive: Path, output_dir: Path | None = None) -> Path:
+    def prepare(
+        self, archive: Path, output_dir: Path | None = None, *, editable: bool = False
+    ) -> Path:
         if not self.should_prepare(archive):
             return archive
 
         if archive.is_dir():
             tmp_dir = tempfile.mkdtemp(prefix="poetry-chef-")
 
-            return self._prepare(archive, Path(tmp_dir))
+            return self._prepare(archive, Path(tmp_dir), editable=editable)
 
         return self._prepare_sdist(archive, destination=output_dir)
 
-    def _prepare(self, directory: Path, destination: Path) -> Path:
+    def _prepare(
+        self, directory: Path, destination: Path, *, editable: bool = False
+    ) -> Path:
         from poetry.utils.env import EnvManager
         from poetry.utils.env import VirtualEnv
 
@@ -129,7 +133,7 @@ class Chef:
                 try:
                     return Path(
                         builder.build(
-                            "wheel",
+                            "wheel" if not editable else "editable",
                             destination.as_posix(),
                         )
                     )
